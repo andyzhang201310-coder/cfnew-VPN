@@ -1,0 +1,157 @@
+name: 从 cfnew 同步 Releases
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '0 */6 * * *'
+
+# 关键：不写这段，GITHUB_TOKEN 默认只读，git push 必定 403
+permissions:
+  contents: write
+
+# 防止手动触发和定时任务撞车，导致 push non-fast-forward
+concurrency:
+  group: sync-cfnew-release
+  cancel-in-progress: false
+
+env:
+  UPSTREAM: byJoey/cfnew
+  ASSET_NAME: Pages.zip
+
+jobs:
+  sync-release:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: 检出仓库
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: 权限自检
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -uo pipefail
+          perm=$(gh api "repos/${{ github.repository }}" --jq '.permissions.push // false')
+          echo "GITHUB_TOKEN push 权限: $perm"
+          if [ "$perm" != "true" ]; then
+            echo "::warning::GITHUB_TOKEN 无推送权限，后续 push 会 403。检查 Settings > Actions > General > Workflow permissions 是否为 Read and write。"
+          fi
+
+      - name: 获取 cfnew 最新发布
+        id: get_latest
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          # 用带认证的 API 调用，避免匿名 60 次/小时限流
+          release=$(gh api "repos/${UPSTREAM}/releases/latest")
+
+          version=$(jq -r '.tag_name // empty' <<<"$release")
+          url=$(jq -r --arg n "$ASSET_NAME" \
+                '[.assets[] | select(.name == $n) | .browser_download_url][0] // empty' <<<"$release")
+
+          if [ -z "$version" ]; then
+            echo "::error::未能解析版本号，上游返回内容如下（前 500 字）："
+            printf '%.500s\n' "$release"
+            exit 1
+          fi
+
+          if [ -z "$url" ]; then
+            echo "::error::最新发布 ${version} 中没有 ${ASSET_NAME}，现有资源："
+            jq -r '.assets[].name' <<<"$release"
+            exit 1
+          fi
+
+          {
+            echo "version=$version"
+            echo "download_url=$url"
+            echo "file_name=$ASSET_NAME"
+          } >> "$GITHUB_OUTPUT"
+
+          echo "最新版本: $version"
+          echo "下载 URL: $url"
+
+      - name: 检查当前版本
+        id: check_version
+        run: |
+          set -euo pipefail
+          if [ -f VERSION.txt ]; then
+            CURRENT_VERSION=$(tr -d '\n\r ' < VERSION.txt)
+          else
+            CURRENT_VERSION=""
+          fi
+
+          NEW_VERSION="${{ steps.get_latest.outputs.version }}"
+          echo "current_version=${CURRENT_VERSION}" >> "$GITHUB_OUTPUT"
+
+          if [ "$CURRENT_VERSION" != "$NEW_VERSION" ]; then
+            echo "need_update=true" >> "$GITHUB_OUTPUT"
+            echo "需要更新: '${CURRENT_VERSION}' -> '${NEW_VERSION}'"
+          else
+            echo "need_update=false" >> "$GITHUB_OUTPUT"
+            echo "版本相同，无需更新"
+          fi
+
+      - name: 下载并更新文件
+        if: steps.check_version.outputs.need_update == 'true'
+        env:
+          DOWNLOAD_URL: ${{ steps.get_latest.outputs.download_url }}
+          FILE_NAME: ${{ steps.get_latest.outputs.file_name }}
+          VERSION: ${{ steps.get_latest.outputs.version }}
+        run: |
+          set -euo pipefail
+
+          # -f 让 HTTP 错误直接失败，不要把错误页当成 zip 存下来
+          curl -fL --retry 3 --retry-delay 3 -o "$FILE_NAME" "$DOWNLOAD_URL"
+
+          # 先验完整性，再决定动不动仓库文件
+          unzip -t "$FILE_NAME" > /dev/null
+          echo "压缩包完整性检查通过"
+
+          rm -rf .staging && mkdir -p .staging
+          unzip -o -q "$FILE_NAME" -d .staging
+
+          # 上游包里若带 .github/workflows，推到自己的仓库会被 GitHub 拒绝
+          # （refusing to allow a GitHub App to create or update workflow）
+          rm -rf .staging/.github
+
+          cp -a .staging/. .
+          rm -rf .staging "$FILE_NAME"
+
+          echo "$VERSION" > VERSION.txt
+          echo "已写入 VERSION.txt: $VERSION"
+          ls -la | head -20
+
+      - name: 提交并推送更改
+        if: steps.check_version.outputs.need_update == 'true'
+        run: |
+          set -euo pipefail
+          git config --local user.email "action@github.com"
+          git config --local user.name "GitHub Action"
+
+          git add -A
+
+          if git diff --cached --quiet; then
+            echo "工作区无变更，跳过提交"
+          else
+            git commit -m "自动同步: 更新到 cfnew ${{ steps.get_latest.outputs.version }}"
+            git push origin "HEAD:${{ github.ref_name }}"
+            echo "已提交并推送"
+          fi
+
+      - name: 输出摘要
+        if: always()
+        run: |
+          {
+            echo "## 同步结果"
+            echo "- 最新版本: ${{ steps.get_latest.outputs.version }}"
+            echo "- 当前版本: ${{ steps.check_version.outputs.current_version }}"
+            if [ "${{ steps.check_version.outputs.need_update }}" = "true" ]; then
+              echo "- 状态: 已更新"
+            else
+              echo "- 状态: 版本相同，无需更新"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
